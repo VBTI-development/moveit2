@@ -78,7 +78,10 @@ target_link_libraries(
           moveit_ros_planning::moveit_trajectory_execution_manager
           moveit_core::moveit_utils
           rclcpp::rclcpp
-          moveit_py_utils)
+          moveit_py_utils
+          # WORKAROUND for https://github.com/moveit/moveit2/pull/3970: dladdr()/dlopen() in
+          # keepControllerManagerLibraryLoaded() (moveit_cpp.cpp). Remove together with it.
+          ${CMAKE_DL_LIBS})
 configure_build_install_location(planning)
 
 if(BUILD_TESTING)
