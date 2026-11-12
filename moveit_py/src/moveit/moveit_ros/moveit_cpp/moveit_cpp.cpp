@@ -36,8 +36,15 @@
 
 #include "moveit_cpp.hpp"
 #include <pybind11/pytypes.h>
+#include <moveit/trajectory_execution_manager/trajectory_execution_manager.hpp>
 #include <moveit/utils/logger.hpp>
 #include <string>
+// <typeinfo> and <dlfcn.h>: only for the keepControllerManagerLibraryLoaded() workaround below.
+#include <typeinfo>
+
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
 
 namespace moveit_py
 {
@@ -46,6 +53,57 @@ namespace bind_moveit_cpp
 rclcpp::Logger getLogger()
 {
   return moveit::getLogger("moveit.py.cpp_initializer");
+}
+
+// WORKAROUND, remove once the fix is released: https://github.com/moveit/moveit2/pull/3970
+//
+// Keeps the controller manager plugin's library loaded until the process exits.
+//
+// What it works around: every process that created a MoveItPy died with SIGSEGV when the MoveItCpp was
+// destroyed (in practice at interpreter exit, right after the "Deleting MoveItCpp" log line), with
+//   rclcpp::CallbackGroup::~CallbackGroup() <- rclcpp::Node::~Node()
+//   <- trajectory_execution_manager::TrajectoryExecutionManager::~TrajectoryExecutionManager()
+//   <- moveit_cpp::MoveItCpp::~MoveItCpp()
+//
+// Why: TrajectoryExecutionManager destroys its plugin loader, which unloads the plugin's library
+// (libmoveit_simple_controller_manager.so), before the node it handed to the plugin. The node's callback
+// group still tracks the action clients the plugin created, through weak pointers whose control blocks
+// are code of the unloaded library, so destroying the node calls into unmapped memory.
+//
+// The real fix is in moveit_ros_planning (the TrajectoryExecutionManager destructor), PR 3970 above, with
+// backports requested for kilted, jazzy and humble. This workaround lives here because moveit_py is the
+// only MoveIt package built from source next to the released moveit_ros_planning binaries.
+//
+// When to remove: as soon as the moveit_ros_planning in use contains the fix, that is a release made
+// after PR 3970 (or its backport to the distro in use) was merged; 2.12.4 and older do NOT have it.
+// Check with `dpkg -s ros-$ROS_DISTRO-moveit-ros-planning | grep Version` against the release's changelog.
+//
+// What to remove: this function, its call in the MoveItPy constructor below, the <typeinfo> and
+// <dlfcn.h> includes above, and ${CMAKE_DL_LIBS} from the `planning` target in moveit_py/CMakeLists.txt.
+// Then verify: a script that creates a MoveItPy and exits must end with exit code 0, not -11.
+void keepControllerManagerLibraryLoaded(const moveit_cpp::MoveItCpp& moveit_cpp)
+{
+#ifndef _WIN32
+  const auto trajectory_execution_manager = moveit_cpp.getTrajectoryExecutionManager();
+  const auto controller_manager =
+      trajectory_execution_manager ? trajectory_execution_manager->getControllerManager() : nullptr;
+  if (!controller_manager)
+  {
+    return;
+  }
+
+  // The plugin class is defined in the plugin's library, and so is its type information.
+  const auto& plugin = *controller_manager;
+  Dl_info library;
+  if (dladdr(&typeid(plugin), &library) == 0 || library.dli_fname == nullptr ||
+      dlopen(library.dli_fname, RTLD_NOW | RTLD_NODELETE) == nullptr)
+  {
+    RCLCPP_WARN(getLogger(), "Could not keep the controller manager plugin's library loaded, "
+                             "destroying this MoveItPy instance may crash");
+  }
+#else
+  (void)moveit_cpp;
+#endif
 }
 
 std::shared_ptr<moveit_cpp::PlanningComponent>
@@ -140,6 +198,8 @@ void initMoveitPy(py::module& m)
              };
 
              std::shared_ptr<moveit_cpp::MoveItCpp> moveit_cpp_ptr(new moveit_cpp::MoveItCpp(node), custom_deleter);
+             // WORKAROUND for https://github.com/moveit/moveit2/pull/3970, see keepControllerManagerLibraryLoaded().
+             keepControllerManagerLibraryLoaded(*moveit_cpp_ptr);
 
              if (provide_planning_service)
              {
